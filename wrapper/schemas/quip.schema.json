@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["emit"],
+  "properties": {
+    "emit": { "type": "boolean" },
+    "text": { "type": "string", "maxLength": 120 },
+    "tone": {
+      "type": "string",
+      "enum": ["pleased", "amused", "concerned", "sleepy", "impressed", "neutral"]
+    }
+  }
+}

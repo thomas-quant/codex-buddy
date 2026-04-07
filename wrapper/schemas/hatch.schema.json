@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "personality_paragraph"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 24
+    },
+    "personality_paragraph": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 500
+    }
+  }
+}
