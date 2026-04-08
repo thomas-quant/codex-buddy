@@ -2,6 +2,12 @@
 
 Clean-room Buddy research plus a working Rust wrapper TUI for Codex.
 
+## Demo
+
+![Terminal screenshot of the Codex wrapper with the Buddy pane visible on the right](demo.png)
+
+Current wrapper UI with the Buddy side pane visible on the right. This capture shows the wrapper shell and Buddy mascot; a future screenshot would be stronger if it also shows the Buddy action menu or status view in use.
+
 ## What Is Here
 
 - [`buddy/`](/root/codex-buddy/buddy)
