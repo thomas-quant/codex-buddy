@@ -1,6 +1,8 @@
 use std::{
+    collections::BTreeSet,
+    env,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -103,6 +105,9 @@ fn build_exec_command(prompt: &str, schema_path: &Path, output_path: &Path, cwd:
     let mut command = Command::new("codex");
     command
         .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .arg("exec")
         .arg("--ephemeral")
         .arg("--skip-git-repo-check")
@@ -117,12 +122,63 @@ fn build_exec_command(prompt: &str, schema_path: &Path, output_path: &Path, cwd:
         .arg("-c")
         .arg(format!(
             "model_reasoning_effort=\"{DEFAULT_REASONING_EFFORT}\""
-        ))
-        .arg(prompt);
+        ));
+
+    if let Some(skill_override) = build_disabled_skills_override(cwd) {
+        command
+            .arg("-c")
+            .arg(format!("skills.config={skill_override}"));
+    }
+
+    command.arg(prompt);
     command
 }
 
 #[allow(dead_code)]
 fn _workspace_relative(path: &Path) -> PathBuf {
     path.to_path_buf()
+}
+
+fn build_disabled_skills_override(cwd: &Path) -> Option<String> {
+    let skill_dirs = collect_skill_dirs(cwd);
+    if skill_dirs.is_empty() {
+        return None;
+    }
+
+    let entries = skill_dirs
+        .iter()
+        .map(|path| {
+            let path_literal = toml::Value::String(path.to_string_lossy().into_owned()).to_string();
+            format!("{{ path = {path_literal}, enabled = false }}")
+        })
+        .collect::<Vec<_>>();
+
+    Some(format!("[{}]", entries.join(", ")))
+}
+
+fn collect_skill_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let mut skill_dirs = BTreeSet::new();
+
+    for ancestor in cwd.ancestors() {
+        append_skill_dirs_from_root(&ancestor.join(".agents/skills"), &mut skill_dirs);
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        append_skill_dirs_from_root(&PathBuf::from(home).join(".agents/skills"), &mut skill_dirs);
+    }
+
+    skill_dirs.into_iter().collect()
+}
+
+fn append_skill_dirs_from_root(root: &Path, skill_dirs: &mut BTreeSet<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() && path.join("SKILL.md").is_file() {
+            skill_dirs.insert(path);
+        }
+    }
 }

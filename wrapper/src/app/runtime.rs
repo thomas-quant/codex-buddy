@@ -1,6 +1,7 @@
 use std::{
-    io::Read,
-    os::unix::net::UnixListener,
+    fs,
+    fs::File,
+    io::{Read, Seek, SeekFrom},
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
     thread,
@@ -11,27 +12,24 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event as CrosstermEvent, KeyCode,
-        KeyEvent, KeyEventKind, KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
     },
     execute,
     terminal::{
         self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     },
 };
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::Rect,
-    widgets::{Block, Borders, Paragraph, Wrap},
-};
+use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect, widgets::Clear};
 use serde_json::json;
-use tempfile::tempdir;
+use tempfile::Builder;
 use uuid::Uuid;
 
 use crate::{
+    app::pty_input::{encode_key_for_pty, encode_mouse_for_pty},
     buddy::{
-        events::{BuddyEvent, BuddyEventKind, normalize_hook_event},
+        animation::BuddyAnimation,
+        events::{BuddyEvent, BuddyEventKind},
         lifecycle::{apply_pet, can_rebirth_at, hatch_fallback},
         policy::{QuipPolicyConfig, can_attempt_long_run_quip},
         quips::sanitize_quip,
@@ -42,15 +40,18 @@ use crate::{
     },
     codex::{
         exec::{QuipRequest, generate_hatch_soul, generate_quip},
-        home::build_codex_home_overlay,
-        hooks::parse_hook_payload,
+        home::{build_codex_home_overlay, resolve_base_codex_home},
         launch::build_codex_launch,
         pty::PtyHost,
+        session::{SessionEvent, SessionEventNormalizer},
     },
     ui::{
-        buddy_pane::{render_idle_lines, render_status_lines},
+        buddy_pane::{
+            BuddyMenuEntry, render_action_menu_lines, render_buddy_widget, render_idle_lines,
+            render_status_lines,
+        },
         layout::{BUDDY_HINT_FOOTER, split_main_and_buddy},
-        pty_view::PtyView,
+        pty_view::{PtyRenderFilter, PtyView},
     },
     util::paths::StoragePaths,
 };
@@ -73,7 +74,8 @@ struct RuntimeOptions {
 }
 
 enum RuntimeEvent {
-    HookPayload(Vec<u8>),
+    BuddyEvent(BuddyEvent),
+    Commentary(String),
     HatchFinished {
         buddy: Box<PersistedBuddy>,
         bones: Box<CompanionBones>,
@@ -99,6 +101,7 @@ struct Runtime {
     summary: RollingSummary,
     recent_turns: Vec<String>,
     active_tool_phase: Option<ActiveToolPhase>,
+    animation: BuddyAnimation,
     session_id: String,
     cwd: PathBuf,
     events_rx: Receiver<RuntimeEvent>,
@@ -108,8 +111,9 @@ struct Runtime {
     hatch_in_flight: bool,
     last_quip_at: Option<DateTime<Utc>>,
     bubble_set_at: Option<Instant>,
+    hidden_commentary: Vec<String>,
     status_message: Option<String>,
-    listener_thread: thread::JoinHandle<()>,
+    session_monitor_thread: thread::JoinHandle<()>,
     _session_dir: tempfile::TempDir,
 }
 
@@ -117,6 +121,7 @@ impl Runtime {
     fn new(opts: RuntimeOptions) -> Result<Self> {
         let mut app = App::new_for_test();
         let storage_paths = StoragePaths::discover()?;
+        let session_root = storage_paths.state_dir.join("sessions");
         let store = BuddyStore::new(storage_paths)?;
         let buddy = store.load_global()?;
         let bones = buddy
@@ -124,12 +129,16 @@ impl Runtime {
             .map(|persisted| roll_with_seed(&persisted.hatch_seed).bones);
         app.set_has_buddy(buddy.is_some());
 
-        let session_dir = tempdir().context("failed to create session directory")?;
-        let socket_path = session_dir.path().join("buddy.sock");
+        fs::create_dir_all(&session_root).context("failed to create wrapper session root")?;
+        let session_dir = Builder::new()
+            .prefix("buddy-wrapper-session-")
+            .tempdir_in(&session_root)
+            .context("failed to create session directory")?;
         let codex_home = session_dir.path().join("codex-home");
+        let base_codex_home = resolve_base_codex_home()?;
         let wrapper_exe = opts.wrapper_exe.display().to_string();
-        let socket_display = socket_path.display().to_string();
-        build_codex_home_overlay(&codex_home, &wrapper_exe, &socket_display)?;
+        let socket_display = session_dir.path().join("buddy.sock").display().to_string();
+        build_codex_home_overlay(&base_codex_home, &codex_home, &wrapper_exe, &socket_display)?;
 
         let (terminal_cols, terminal_rows) = terminal::size()?;
         let main_rect = main_pane_rect(terminal_cols, terminal_rows);
@@ -143,7 +152,8 @@ impl Runtime {
         )?;
 
         let (events_tx, events_rx) = mpsc::channel();
-        let listener_thread = spawn_hook_listener(socket_path, events_tx.clone())?;
+        let session_monitor_thread =
+            spawn_session_monitor(codex_home.join("sessions"), events_tx.clone());
 
         Ok(Self {
             app,
@@ -155,6 +165,7 @@ impl Runtime {
             summary: RollingSummary::default(),
             recent_turns: Vec::new(),
             active_tool_phase: None,
+            animation: BuddyAnimation::new(Instant::now()),
             session_id: Uuid::new_v4().to_string(),
             cwd: opts.cwd,
             events_rx,
@@ -164,8 +175,9 @@ impl Runtime {
             hatch_in_flight: false,
             last_quip_at: None,
             bubble_set_at: None,
+            hidden_commentary: Vec::new(),
             status_message: None,
-            listener_thread,
+            session_monitor_thread,
             _session_dir: session_dir,
         })
     }
@@ -199,8 +211,12 @@ impl Runtime {
                     }
                     CrosstermEvent::Paste(text) => {
                         if self.app.focus() == UiFocus::Pty {
+                            self.pty.scroll_to_bottom();
                             self.pty.write_all(text.as_bytes())?;
                         }
+                    }
+                    CrosstermEvent::Mouse(mouse) => {
+                        self.handle_mouse(mouse, Rect::new(0, 0, previous_size.0, previous_size.1))?
                     }
                     CrosstermEvent::Resize(cols, rows) => {
                         let main_rect = main_pane_rect(cols, rows);
@@ -221,41 +237,45 @@ impl Runtime {
             }
         }
 
-        let _ = &self.listener_thread;
+        let _ = &self.session_monitor_thread;
         Ok(())
     }
 
     fn draw(&self, frame: &mut ratatui::Frame<'_>) {
         let [main_rect, buddy_rect] = split_main_and_buddy(frame.area());
-        frame.render_widget(
-            self.pty_view
-                .render(self.pty.screen_text(), self.app.focus() == UiFocus::Pty),
-            main_rect,
-        );
+        let filter = PtyRenderFilter::new(self.hidden_commentary.iter().map(String::as_str));
+        frame.render_widget(self.pty_view.render(self.pty.screen(), filter), main_rect);
 
-        let buddy_text = self.render_buddy_text();
-        let buddy_widget = Paragraph::new(buddy_text)
-            .block(
-                Block::default()
-                    .title(if self.app.focus() == UiFocus::BuddyPane {
-                        " Buddy * "
-                    } else {
-                        " Buddy "
-                    })
-                    .borders(Borders::ALL),
-            )
-            .wrap(Wrap { trim: false });
-        frame.render_widget(buddy_widget, buddy_rect);
+        frame.render_widget(Clear, buddy_rect);
+        frame.render_widget(render_buddy_widget(self.render_buddy_text()), buddy_rect);
     }
 
     fn render_buddy_text(&self) -> String {
+        let frame = self.animation.current_frame();
+        if self.app.is_buddy_menu_open() {
+            let items = self.menu_items();
+            let entries = items
+                .iter()
+                .enumerate()
+                .map(|(idx, item)| {
+                    BuddyMenuEntry::new(
+                        &item.label,
+                        idx == self.selected_menu_index(),
+                        item.enabled,
+                    )
+                })
+                .collect::<Vec<_>>();
+            return render_action_menu_lines(&entries, self.status_message.as_deref()).join("\n");
+        }
+
         let mut lines = match (&self.buddy, &self.bones) {
             (Some(buddy), Some(bones)) if self.app.is_buddy_status_open() => {
-                render_status_lines(buddy, bones, Utc::now())
+                render_status_lines(buddy, bones, frame, Utc::now())
             }
             (Some(buddy), Some(bones)) => render_idle_lines(
                 buddy,
                 bones,
+                frame,
                 self.app.active_quip(),
                 self.app.focus() == UiFocus::BuddyPane,
             ),
@@ -284,19 +304,7 @@ impl Runtime {
             lines.push(BUDDY_HINT_FOOTER.to_string());
         }
 
-        if self.app.is_buddy_menu_open() {
-            lines.push(String::new());
-            lines.push("Actions".to_string());
-            for (idx, item) in self.menu_items().iter().enumerate() {
-                let cursor = if idx == self.selected_menu_index() {
-                    ">"
-                } else {
-                    " "
-                };
-                let suffix = if item.enabled { "" } else { " [locked]" };
-                lines.push(format!("{cursor} {}{}", item.label, suffix));
-            }
-        } else if self.app.is_buddy_status_open() {
+        if self.app.is_buddy_status_open() {
             lines.push(String::new());
             lines.push("Esc: back".to_string());
         }
@@ -321,8 +329,17 @@ impl Runtime {
                 self.app.apply(AppAction::ToggleFocus);
                 Ok(false)
             }
+            KeyCode::PageUp => {
+                self.pty.scroll_up(page_scroll_rows(self.pty.screen()));
+                Ok(false)
+            }
+            KeyCode::PageDown => {
+                self.pty.scroll_down(page_scroll_rows(self.pty.screen()));
+                Ok(false)
+            }
             _ => {
                 if let Some(bytes) = encode_key_for_pty(key) {
+                    self.pty.scroll_to_bottom();
                     self.pty.write_all(&bytes)?;
                 }
                 Ok(false)
@@ -363,6 +380,34 @@ impl Runtime {
         Ok(false)
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> Result<()> {
+        if self.app.focus() != UiFocus::Pty {
+            return Ok(());
+        }
+
+        let [main_rect, buddy_rect] = split_main_and_buddy(area);
+        if rect_contains(buddy_rect, mouse.column, mouse.row) {
+            return Ok(());
+        }
+
+        if !rect_contains(main_rect, mouse.column, mouse.row) {
+            return Ok(());
+        }
+
+        if let Some(bytes) = encode_mouse_for_pty(mouse, main_rect, self.pty.screen()) {
+            self.pty.scroll_to_bottom();
+            self.pty.write_all(&bytes)?;
+        } else {
+            match mouse.kind {
+                crossterm::event::MouseEventKind::ScrollUp => self.pty.scroll_up(3),
+                crossterm::event::MouseEventKind::ScrollDown => self.pty.scroll_down(3),
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
     fn activate_menu_item(&mut self) -> Result<()> {
         let Some(item) = self.menu_items().get(self.selected_menu_index()).cloned() else {
             return Ok(());
@@ -377,6 +422,7 @@ impl Runtime {
             BuddyMenuAction::Hatch => self.spawn_hatch(false),
             BuddyMenuAction::Status => self.app.apply(AppAction::OpenBuddyStatus),
             BuddyMenuAction::Pet => {
+                self.animation.start_pet(Instant::now());
                 self.app
                     .set_last_pet_at_ms(Some(apply_pet(Utc::now().timestamp_millis())));
                 self.status_message = Some("Buddy brightens a bit.".to_string());
@@ -446,11 +492,13 @@ impl Runtime {
     fn drain_runtime_events(&mut self) -> Result<()> {
         while let Ok(event) = self.events_rx.try_recv() {
             match event {
-                RuntimeEvent::HookPayload(payload) => self.handle_hook_payload(&payload)?,
+                RuntimeEvent::BuddyEvent(event) => self.handle_buddy_event(event),
+                RuntimeEvent::Commentary(message) => self.push_hidden_commentary(message),
                 RuntimeEvent::HatchFinished { buddy, bones } => {
                     self.store.save_global(&buddy)?;
                     self.buddy = Some(*buddy);
                     self.bones = Some(*bones);
+                    self.animation.reset(Instant::now());
                     self.app.set_has_buddy(true);
                     self.hatch_in_flight = false;
                     self.status_message = Some("Buddy is alive.".to_string());
@@ -476,9 +524,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn handle_hook_payload(&mut self, payload: &[u8]) -> Result<()> {
-        let raw = parse_hook_payload(payload)?;
-        let event = normalize_hook_event(&raw)?;
+    fn handle_buddy_event(&mut self, event: BuddyEvent) {
         self.session_id = event.session_id.clone();
 
         if let Some(prompt) = &event.user_excerpt {
@@ -502,7 +548,6 @@ impl Runtime {
 
         self.summary.apply(&event);
         self.maybe_spawn_quip(event);
-        Ok(())
     }
 
     fn maybe_spawn_quip(&mut self, event: BuddyEvent) {
@@ -566,6 +611,8 @@ impl Runtime {
     }
 
     fn tick(&mut self) {
+        self.animation.tick(Instant::now());
+
         if let Some(set_at) = self.bubble_set_at
             && set_at.elapsed() >= QUIET_BUBBLE_LIFETIME
         {
@@ -623,6 +670,25 @@ impl Runtime {
         self.recent_turns.push(line);
         if self.recent_turns.len() > 4 {
             self.recent_turns.remove(0);
+        }
+    }
+
+    fn push_hidden_commentary(&mut self, line: String) {
+        let normalized = line.trim().to_string();
+        if normalized.is_empty() {
+            return;
+        }
+        if self
+            .hidden_commentary
+            .last()
+            .is_some_and(|last| last == &normalized)
+        {
+            return;
+        }
+
+        self.hidden_commentary.push(normalized);
+        if self.hidden_commentary.len() > 16 {
+            self.hidden_commentary.remove(0);
         }
     }
 
@@ -720,7 +786,12 @@ impl TerminalSession {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        )?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         Ok(Self { terminal })
@@ -741,50 +812,10 @@ impl Drop for TerminalSession {
         let _ = execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
+            DisableMouseCapture,
             LeaveAlternateScreen
         );
         let _ = self.terminal.show_cursor();
-    }
-}
-
-fn spawn_hook_listener(
-    socket_path: PathBuf,
-    tx: Sender<RuntimeEvent>,
-) -> Result<thread::JoinHandle<()>> {
-    let listener = UnixListener::bind(socket_path)?;
-    Ok(thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else {
-                break;
-            };
-            let mut payload = Vec::new();
-            if stream.read_to_end(&mut payload).is_ok()
-                && tx.send(RuntimeEvent::HookPayload(payload)).is_err()
-            {
-                break;
-            }
-        }
-    }))
-}
-
-fn encode_key_for_pty(key: KeyEvent) -> Option<Vec<u8>> {
-    match key.code {
-        KeyCode::Enter => Some(vec![b'\r']),
-        KeyCode::Backspace => Some(vec![0x7f]),
-        KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Left => Some(b"\x1b[D".to_vec()),
-        KeyCode::Right => Some(b"\x1b[C".to_vec()),
-        KeyCode::Up => Some(b"\x1b[A".to_vec()),
-        KeyCode::Down => Some(b"\x1b[B".to_vec()),
-        KeyCode::Home => Some(b"\x1b[H".to_vec()),
-        KeyCode::End => Some(b"\x1b[F".to_vec()),
-        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
-        KeyCode::Char(ch) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let lower = ch.to_ascii_lowercase() as u8;
-            Some(vec![lower.saturating_sub(b'a') + 1])
-        }
-        KeyCode::Char(ch) => Some(ch.to_string().into_bytes()),
-        _ => None,
     }
 }
 
@@ -810,12 +841,127 @@ fn quip_blacklisted(event: &BuddyEvent) -> bool {
 fn main_pane_rect(cols: u16, rows: u16) -> Rect {
     let area = Rect::new(0, 0, cols, rows);
     let [main, _buddy] = split_main_and_buddy(area);
-    Rect::new(
-        main.x,
-        main.y,
-        main.width.saturating_sub(2),
-        main.height.saturating_sub(2),
-    )
+    main
+}
+
+fn page_scroll_rows(screen: &vt100::Screen) -> usize {
+    usize::from(screen.size().0.saturating_sub(1).max(1))
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+fn spawn_session_monitor(
+    sessions_root: PathBuf,
+    tx: Sender<RuntimeEvent>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut tracked_file: Option<PathBuf> = None;
+        let mut offset = 0_u64;
+        let mut remainder = String::new();
+        let mut normalizer = SessionEventNormalizer::default();
+
+        loop {
+            let Some(session_file) = newest_session_file(&sessions_root) else {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            };
+
+            if tracked_file.as_ref() != Some(&session_file) {
+                tracked_file = Some(session_file.clone());
+                offset = 0;
+                remainder.clear();
+                normalizer = SessionEventNormalizer::default();
+            }
+
+            let Ok(metadata) = fs::metadata(&session_file) else {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            };
+            if metadata.len() < offset {
+                offset = 0;
+                remainder.clear();
+                normalizer = SessionEventNormalizer::default();
+            }
+
+            let Ok(mut file) = File::open(&session_file) else {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            };
+            if file.seek(SeekFrom::Start(offset)).is_err() {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+
+            let mut chunk = String::new();
+            if file.read_to_string(&mut chunk).is_ok() && !chunk.is_empty() {
+                offset += u64::try_from(chunk.len()).unwrap_or(offset);
+                remainder.push_str(&chunk);
+
+                while let Some(index) = remainder.find('\n') {
+                    let line = remainder[..index].to_string();
+                    remainder.drain(..=index);
+
+                    let Ok(events) = normalizer.push_line(&line) else {
+                        continue;
+                    };
+                    for event in events {
+                        let runtime_event = match event {
+                            SessionEvent::Buddy(event) => RuntimeEvent::BuddyEvent(event),
+                            SessionEvent::Commentary(message) => RuntimeEvent::Commentary(message),
+                        };
+                        if tx.send(runtime_event).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+
+            thread::sleep(Duration::from_millis(50));
+        }
+    })
+}
+
+fn newest_session_file(root: &std::path::Path) -> Option<PathBuf> {
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    let mut pending = vec![root.to_path_buf()];
+
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let Ok(modified_at) = metadata.modified() else {
+                continue;
+            };
+
+            let replace = newest
+                .as_ref()
+                .is_none_or(|(current_time, _)| modified_at >= *current_time);
+            if replace {
+                newest = Some((modified_at, path));
+            }
+        }
+    }
+
+    newest.map(|(_, path)| path)
 }
 
 fn run(opts: RuntimeOptions) -> Result<()> {

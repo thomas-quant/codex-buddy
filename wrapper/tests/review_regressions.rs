@@ -14,26 +14,10 @@ use chrono::{Duration, TimeZone, Utc};
 use serde_json::Value;
 
 #[test]
-fn hooks_json_registers_supported_events_and_unfiltered_tool_hooks() {
+fn hooks_json_is_inert_when_wrapper_uses_session_logs_instead() {
     let raw = render_hooks_json("/tmp/buddy-wrapper", "/tmp/buddy.sock");
     let parsed: Value = serde_json::from_str(&raw).unwrap();
-    let hooks = parsed.get("hooks").unwrap();
-
-    for name in [
-        "SessionStart",
-        "UserPromptSubmit",
-        "PreToolUse",
-        "PostToolUse",
-        "Stop",
-    ] {
-        assert!(hooks.get(name).is_some(), "missing {name}");
-    }
-
-    for name in ["PreToolUse", "PostToolUse"] {
-        let entries = hooks.get(name).unwrap().as_array().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].get("matcher").is_none());
-    }
+    assert_eq!(parsed, serde_json::json!({ "hooks": {} }));
 }
 
 #[test]
@@ -126,7 +110,7 @@ fn status_view_shows_hatch_age_and_rebirth_availability() {
     };
 
     let now = Utc.with_ymd_and_hms(2026, 4, 7, 12, 0, 0).unwrap();
-    let lines = render_status_lines(&buddy, &CompanionBones::test_fixture(), now);
+    let lines = render_status_lines(&buddy, &CompanionBones::test_fixture(), 0, now);
 
     assert!(
         lines
@@ -153,7 +137,7 @@ fn status_view_shows_rebirth_cooldown_when_not_ready() {
     };
 
     let now = buddy.hatched_at + Duration::days(5);
-    let lines = render_status_lines(&buddy, &CompanionBones::test_fixture(), now);
+    let lines = render_status_lines(&buddy, &CompanionBones::test_fixture(), 0, now);
 
     assert!(
         lines
