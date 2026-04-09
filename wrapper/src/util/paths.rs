@@ -1,6 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,4 +29,29 @@ impl StoragePaths {
             global_buddy_file: root.join("buddy-state.json"),
         }
     }
+}
+
+pub fn resolve_codex_session_root(
+    storage_paths: &StoragePaths,
+    base_codex_home: &Path,
+) -> Result<PathBuf> {
+    let primary_root = storage_paths.state_dir.join("sessions");
+    if !is_temporary_path(&primary_root) {
+        return Ok(primary_root);
+    }
+
+    let fallback_root = base_codex_home.join("buddy-wrapper").join("sessions");
+    if !is_temporary_path(&fallback_root) {
+        return Ok(fallback_root);
+    }
+
+    bail!(
+        "refusing to create Codex session roots under temporary directories (state_dir: {}, CODEX_HOME: {})",
+        storage_paths.state_dir.display(),
+        base_codex_home.display()
+    );
+}
+
+fn is_temporary_path(path: &Path) -> bool {
+    path.starts_with(env::temp_dir())
 }

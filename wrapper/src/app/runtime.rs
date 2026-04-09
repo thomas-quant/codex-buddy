@@ -53,7 +53,7 @@ use crate::{
         layout::{BUDDY_HINT_FOOTER, split_main_and_buddy},
         pty_view::{PtyRenderFilter, PtyView},
     },
-    util::paths::StoragePaths,
+    util::paths::{StoragePaths, resolve_codex_session_root},
 };
 
 use super::{App, AppAction, UiFocus};
@@ -121,7 +121,8 @@ impl Runtime {
     fn new(opts: RuntimeOptions) -> Result<Self> {
         let mut app = App::new_for_test();
         let storage_paths = StoragePaths::discover()?;
-        let session_root = storage_paths.state_dir.join("sessions");
+        let base_codex_home = resolve_base_codex_home()?;
+        let session_root = resolve_codex_session_root(&storage_paths, &base_codex_home)?;
         let store = BuddyStore::new(storage_paths)?;
         let buddy = store.load_global()?;
         let bones = buddy
@@ -135,7 +136,6 @@ impl Runtime {
             .tempdir_in(&session_root)
             .context("failed to create session directory")?;
         let codex_home = session_dir.path().join("codex-home");
-        let base_codex_home = resolve_base_codex_home()?;
         let wrapper_exe = opts.wrapper_exe.display().to_string();
         let socket_display = session_dir.path().join("buddy.sock").display().to_string();
         build_codex_home_overlay(&base_codex_home, &codex_home, &wrapper_exe, &socket_display)?;
