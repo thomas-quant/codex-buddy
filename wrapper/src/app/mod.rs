@@ -1,4 +1,5 @@
 pub mod event;
+pub mod pty_input;
 mod runtime;
 
 pub use runtime::run_default;

@@ -5,15 +5,9 @@ pub fn parse_hook_payload(bytes: &[u8]) -> anyhow::Result<Value> {
 }
 
 pub fn render_hooks_json(wrapper_exe: &str, socket_path: &str) -> String {
-    format!(
-        r#"{{
-  "hooks": {{
-    "SessionStart": [{{ "matcher": "startup|resume", "hooks": [{{ "type": "command", "command": "{wrapper_exe} hook-relay --socket {socket_path}" }}] }}],
-    "UserPromptSubmit": [{{ "hooks": [{{ "type": "command", "command": "{wrapper_exe} hook-relay --socket {socket_path}" }}] }}],
-    "PreToolUse": [{{ "hooks": [{{ "type": "command", "command": "{wrapper_exe} hook-relay --socket {socket_path}" }}] }}],
-    "PostToolUse": [{{ "hooks": [{{ "type": "command", "command": "{wrapper_exe} hook-relay --socket {socket_path}" }}] }}],
-    "Stop": [{{ "hooks": [{{ "type": "command", "command": "{wrapper_exe} hook-relay --socket {socket_path}" }}] }}]
-  }}
-}}"#
-    )
+    let _ = (wrapper_exe, socket_path);
+    r#"{
+  "hooks": {}
+}"#
+    .to_string()
 }

@@ -7,7 +7,9 @@ use std::{
 
 use anyhow::Result;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use vt100::Parser;
+use vt100::{Parser, Screen};
+
+const PTY_SCROLLBACK_LEN: usize = 4_000;
 
 pub struct PtyHost {
     parser: Parser,
@@ -90,7 +92,7 @@ impl PtyHost {
         });
 
         Ok(Self {
-            parser: Parser::new(rows, cols, 0),
+            parser: Parser::new(rows, cols, PTY_SCROLLBACK_LEN),
             writer,
             child,
             master,
@@ -130,5 +132,23 @@ impl PtyHost {
 
     pub fn screen_text(&self) -> String {
         self.parser.screen().contents()
+    }
+
+    pub fn screen(&self) -> &Screen {
+        self.parser.screen()
+    }
+
+    pub fn scroll_up(&mut self, rows: usize) {
+        let current = self.parser.screen().scrollback();
+        self.parser.set_scrollback(current.saturating_add(rows));
+    }
+
+    pub fn scroll_down(&mut self, rows: usize) {
+        let current = self.parser.screen().scrollback();
+        self.parser.set_scrollback(current.saturating_sub(rows));
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.parser.set_scrollback(0);
     }
 }

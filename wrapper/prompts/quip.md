@@ -15,4 +15,5 @@ Rules:
 - emit at most one short line
 - max 80 visible characters after sanitization
 - do not mock, moralize, or restate raw secrets
-- it is acceptable to return {"emit": false}
+- always include `text` and `tone`
+- use `null` for `text` and `tone` when no quip should be emitted

@@ -13,8 +13,13 @@ pub fn build_codex_launch(cwd: &Path, codex_home: &Path) -> CodexLaunch {
     CodexLaunch {
         command: "codex".into(),
         args: vec![
-            "--enable".into(),
-            "codex_hooks".into(),
+            "--no-alt-screen".into(),
+            "-c".into(),
+            "history.persistence=\"none\"".into(),
+            "-c".into(),
+            "hide_agent_reasoning=true".into(),
+            "-c".into(),
+            "model_reasoning_summary=\"none\"".into(),
             "--cd".into(),
             cwd.display().to_string(),
         ],
